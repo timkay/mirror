@@ -1,0 +1,534 @@
+#!/usr/bin/perl -s
+
+###
+### mirror - copy MySQL tables between servers
+###
+### Copyright 2006-2008 Timothy Kay
+###
+
+
+$version = "1.005";
+
+
+if ($h || $help || !@ARGV)
+{
+    print <<'EOF';
+Usage:	$0 [-v] [-t] [-f] [-do="..."] [-where="..."] [DST_HOST.DST_DB.DST_TABLE=SRC_HOST.SRC_DB.SRC_TABLE ...]
+
+where
+	-v	    verbose (-vv or -vvv for more verbose)
+	-t	    Update target tables only if they are older than the source table.
+	-do=...	    Run commands when finished copying.	 If -t is specified, then
+		    commands are run only if a target table gets updated.
+	-where=...  Copy only the rows that meet the where constraint.
+	-f	    The target is a file.  In the filename *'s will be replaced with
+		    the source host, database, and table names.
+	-create	    Store the SQL create statement with the target file.
+	-stage	    Create a temporary table with the results before sending anything.
+		    The source table is freed up quickly with this option.
+	-batch=NNNN Specify the number of records to insert per batch.  (Default: 1000)
+	-z	    Use compression
+	-no-alias-detect
+		    Do not detect if target servers are aliases of the source server
+	-keep=N	    Keep N old copies of the table in the target directory.
+
+Full-word switches can be specified with - or -- (e.g. -create or --create).
+
+Examples:
+	mirror db3.temp.test=db4.v2info.pmhit
+		copy table v2fino.pmhit from db4 to db3 and rename temp.test
+
+	mirror db3.*.*=db2.v2info.*
+		copies all tables from db2.v2info to db3.v2info
+
+	mirror db3.other.*=db2.v2info.*
+		copies all tables from db2.v2info to db3.other
+
+	mirror -t -do="./mkslice -campaign_id=11,19" db.*.*=pd1.v2info.sourced
+		copies v2info.sourced from pd1 to db if the source is newer than the
+		target.	 If the table is copied, then the mkslice command is run.
+
+	mirror -f sourced.csv=dbany.v2info.sourced
+		creates a tab-separated file "sourced.csv" from the contents of
+		table v2info.sourced on dbany
+
+	mirror -t -do="./mkslice -campaign_id=11,19" -where=0 sourced.timestamp=dbany.v2info.sourced
+		checks to see if the file sourced.timestamp is older than the latest table updates.  If
+		so, the file modification time is updated, and the mkslice command is run.
+EOF
+
+    print "mirror v$version\n";
+    exit;
+}
+
+
+# Here is a list of hardwared collections target servers.
+
+%collection = (
+	       db => [qw(db2 db3 db4)],
+	       null => [],
+	       );
+
+$username ||= "root";
+
+
+use DBI;
+use IO::File;
+
+
+# for full-word switches, accept -muli_word, -multi-word, and --multi-word
+for (qw(do where create stage batch no-alias-detect))
+{
+    (my $u = $_) =~ s/-/_/g;
+    ${$u} = defined ${"-$_"}? ${"-$_"}: defined ${$u}? ${$u}: ${$_};
+}
+
+$batch ||= 1000;
+
+$v = 2 if $vv;
+$v = 3 if $vvv;
+
+print "mirror v$version\n" if $v;
+
+$where_clause = "where $where" if defined $where;
+
+
+for my $argv (@ARGV)
+{
+    my($dst, $src) = $argv =~ /^(.+)=(.+?)$/;
+
+    die "target missing (argv=$argv)\n" unless $dst;
+    die "source missing (argv=$argv)\n" unless $src;
+
+    my($src_host, $src_db, $src_table) = $src =~ /^(.+)\.(.+?)\.(.+?)$/;
+    my($dst_host, $dst_db, $dst_table) = $dst =~ /^(.+)\.(.+?)\.(.+?)$/ unless $f;
+
+    print "src=$src_host / $src_db / $src_table dst=$dst_host / $dst_db / $dst_table\n" if $v >= 2;
+
+    die "usage: $0 host.db.table=host.db.table\n" unless $src_host && $src_db && $src_table && ($f || $dst_host && $dst_db && $dst_table);
+
+    my $compression = ";mysql_compression=1" if $z;
+
+    my $src_host_resource = $src_host;
+    my($child);
+
+    if ($src_host =~ /\@/)
+    {
+	unless ($child = fork())
+	{
+	    exec "ssh -qNn -o PasswordAuthentication=no $src_host -L 33060:localhost:3306";
+	    die;
+	}
+
+	$src_host_resource = "127.0.0.1:33060";
+	print "connecting to $src_host via ssh $src_host_resource\n" if $v;
+	sleep 2;
+    }
+
+    my $dbh_src = DBI->connect("dbi:mysql:;host=$src_host_resource;mysql_connect_timeout=30$compression", $username, $password, {PrintError => 0, RaiseError => 1})
+	or die "$dbh_src: @{[DBI->errstr]}\n";
+
+    if (!$no_alias_detect)
+    {
+	# create table as necessary to determine name aliases
+	dbh_do($dbh_src, "create database if not exists mirror_temp");
+	dbh_do($dbh_src, "create table if not exists mirror_temp.alias (alias varchar(64) not null primary key)");
+    }
+
+    my @dst_host = $dst_host unless $f;
+    @dst_host = @{$collection{$dst_host}} if exists $collection{$dst_host};
+    @dst_host = split(/,/, $1) if $dst_host =~ /^{(.*)}$/;
+
+    # @dst_host is empty when -f, so this next loop is skipped
+
+    my(@dbh_dst);
+
+    if (@dst_host)
+    {
+	for my $dst_host (@dst_host)
+	{
+	    # skip any targets that are syntactically the same as source
+	    if (($dst_host eq '*' || $dst_host eq $src_host) && ($dst_db eq '*' || $dst_db eq $src_db) && ($dst_table eq '*' || $dst_table eq $src_table))
+	    {
+		print "$dst_host: target $dst_host is the same as source $src_host; skipping\n" if $v;
+		next;
+	    }
+
+	    my $dbh_dst = DBI->connect("dbi:mysql:;host=$dst_host;mysql_connect_timeout=30$compression", $username, $password, {PrintError => 0, RaiseError => 1})
+		or die "$dbh_src: @{[DBI->errstr]}\n";
+
+	    if (!$no_alias_detect)
+	    {
+		if (($dst_db eq '*' || $dst_db eq $src_db) && ($dst_table eq '*' || $dst_table eq $src_table))
+		{
+		    # skip any targets that are semantically the same as source
+		    dbh_do($dbh_dst, "create database if not exists mirror_temp");
+		    dbh_do($dbh_dst, "create table if not exists mirror_temp.alias (alias varchar(64) not null primary key)");
+
+		    # pick a random number, stick it in here, and see if it comes out there
+		    my $rand = rand;
+
+		    # insert alias into target alias table
+		    dbh_do($dbh_dst, "insert into mirror_temp.alias set alias = ?", undef, $rand);
+		    # now check to see if that alias showed up in the source alias table
+		    my $alias = 0 + dbh_do($dbh_src, "delete from mirror_temp.alias where alias = ?", undef, $rand);
+
+		    if ($alias)
+		    {
+			print "$dst_host: target $dst_host is an alias for source $src_host; skipping\n" if $v;
+			next;
+		    }
+		    else
+		    {
+			dbh_do($dbh_dst, "delete from mirror_temp.alias where alias = ?", undef, $rand);
+		    }
+		}
+	    }
+
+	    push @dbh_dst, $dbh_dst;
+	}
+
+	unless (@dbh_dst)
+	{
+	    print "no targets left!\n" if $v;
+	    exit;
+	}
+    }
+
+    print "connected to $dbh_src ($src_host) and @dbh_dst (@dst_host)\n" if $v >= 2;
+
+    my @src_table = split(/,/, $src_table);
+
+    if ($src_table eq '*')
+    {
+	@src_table = @{$dbh_src->selectcol_arrayref("show tables in $src_db")};
+    }
+
+    for my $src_table (@src_table)
+    {
+	my $dst = $dst;
+	$dst =~ s/\*([^\*]*)$/$_$1/ for ($src_table, $src_db, $src_host);
+
+	# $dst_db and $dst_table remain empty when -f
+	my $dst_db = $dst_db eq '*'? $src_db: $dst_db;
+	my $dst_table = $dst_table eq '*'? $src_table: $dst_table;
+
+	print "src_host=$src_host  src_db=$src_db  src_table=$src_table\n" if $v >= 2;
+	print "dst_host=@dst_host  dst_db=$dst_db  dst_table=$dst_table\n" if $v >= 2 || ($v && @dst_table > 1);
+
+	my $tag = sprintf "%-40s", "$dst_host.$dst_db.$dst_table:";
+	$tag = sprintf "%-40s", "$dst:" if $f;
+
+	if ($t)
+	{
+	    my($src_updated) = $dbh_src->selectrow_hashref("show table status from $src_db like '$src_table'")->{Update_time};
+
+	    # We have to use MySQL to do this calculation because we have no way to know what timezone the server is in.
+	    my($src_now, $src_age) = $dbh_src->selectrow_array("select now(), unix_timestamp() - unix_timestamp(?)", undef, $src_updated);
+
+	    print "source age = $src_now - $src_updated (@{[hms($src_age)]} ago)\n" if $v >= 2;
+
+	    my($out_of_date);
+
+	    if ($f)
+	    {
+		# file is out of date if it doesn't exist, or if source is younger
+		$out_of_date++;
+		$out_of_date = $src_age < time - (stat $dst)[9] if -e $dst;
+	    }
+	    else
+	    {
+		for my $dbh_dst (@dbh_dst)
+		{
+		    local $dbh_dst->{RaiseError} = 0;
+
+		    my $table_status = $dbh_dst->selectrow_hashref("show table status from $dst_db like '$dst_table'");
+		    my($dst_updated) = $table_status->{Update_time} if $table_status;
+		    my($dst_now, $dst_age) = $dbh_dst->selectrow_array("select now(), unix_timestamp() - unix_timestamp(?)", undef, $dst_updated) if $dst_updated;
+		    print "target age = $dst_now - $dst_updated (@{[hms($dst_age)]} ago)\n" if $v >= 2;
+
+		    # if there is no dst or if src is younger than dst
+		    if (!$dst_updated || $src_age < $dst_age)
+		    {
+			$out_of_date++;
+			last;
+		    }
+		}
+	    }
+
+	    unless ($out_of_date)
+	    {
+		print "$tag\tup to date\n" if $v;
+		next;
+	    }
+	}
+
+	$dodo++;		# make note of the fact that we moved at least one table
+
+
+	#
+	# get SQL to create table, and check to see if it's a view (ingored)
+	#
+	my $sql = "show create table $src_db.$src_table";
+	my(undef, $sql_create) = $dbh_src->selectrow_array($sql);
+
+	my $temptable = "mirror_temp.$dst_db\$$dst_table";
+
+	# a view looks like:
+	# CREATE ALGORITHM=UNDEFINED DEFINER=`timkay`@`%` SQL SECURITY DEFINER VIEW `v2data`.`db` AS select _latin1'db2' AS `db2`
+
+	if ($sql_create =~ /DEFINER VIEW/) # idk if this is the right way to conclude that it's a view
+	{
+	    print "WARNING: skipped $src_db.$src_table because it is a view\n";
+	    next;
+	}
+
+
+	if ($f)
+	{
+	    my $s = $dst;
+	    $s = ">$s" unless $s =~ /^\s*[\|\>]/;
+	    open(CSV, $s) || die "$s: $!\n";
+	    print CSV "$sql_create\n\n" if $create;
+	}
+
+
+	$sql_create =~ s/CREATE TABLE.*?\(/CREATE TABLE $temptable \(/s
+	    or die "create table $temptable:  could not change SQL statment\n\t$sql_create";
+
+	$sql_create =~ s/\)\s+(?:ENGINE|TYPE)=(\w+).*$/\)/
+	    or die "no ENGINE|TYPE in $sql_create";
+	my($engine) = ($1);
+
+	# With mysql_use_result=1, we don't get a proper row count, so get the count first.
+	# Don't do "select count(*)" on an InnoDB table, as it does a full table scan.	Thanks
+	# for the workaround, Del.
+	my $sql = "select NULL, NULL, NULL, NULL, count(*) from $src_db.$src_table $where_clause";
+	$sql = "show table status from $src_db like '$src_table'" if $engine !~ /myisam/i;
+	(undef, undef, undef, undef, my $n) = $dbh_src->selectrow_array($sql);
+
+	# mysql_use_result=1 tells MySQL on the receiving end to use the source records as
+	# they arrive rather than read and buffer them all first.  This option locks the
+	# source longer, but we don't run out of memory for large tables.
+	#
+	# SQL_BUFFER_RESULT tells MySQL on the sending end to make a copy of the result in
+	# a temporary table before sending results.  This option frees the source as
+	# quickly as possible.
+	my $SQL_BUFFER_RESULT = "SQL_BUFFER_RESULT" if $stage;
+	my $sth_src = $dbh_src->prepare("select $SQL_BUFFER_RESULT * from $src_db.$src_table $where_clause", {mysql_use_result => 1});
+	$sth_src->execute;
+
+	my @col = @{$sth_src->{NAME_lc}};
+	my $ncol = @col;
+
+	my $ignore = "ignore" if $ignore;
+	my $sql_dst = "insert $ignore into $temptable values (@{[join(',', ('?') x $ncol)]})";
+
+	my(@sth_dst);
+
+	# @dbh_dst is empty when -f
+	for my $dbh_dst (@dbh_dst)
+	{
+	    dbh_do($dbh_dst, "create database if not exists mirror_temp");
+	    dbh_do($dbh_dst, "drop table if exists $temptable");
+	    dbh_do($dbh_dst, "use mirror_temp");
+	    dbh_do($dbh_dst, $sql_create);
+	    dbh_do($dbh_dst, "lock tables $temptable write");
+	    dbh_do($dbh_dst, "alter table $temptable disable keys");
+	}
+
+	my $count = 0;
+	my $timed = my $start = time;
+
+	for (;;)
+	{
+	    my $sql = "insert $ignore into $temptable values";
+	    my $m = 0;
+
+	    for (1 .. $batch)
+	    {
+		my @row = $sth_src->fetchrow_array;
+
+		last unless @row;
+
+		print "\t@row\n" if $v >= 3;
+		if ($e)
+		{
+		    my(%cell);
+		    @cell{@col} = @row;
+		    eval $e;
+		    die $@ if $@;
+		    @row = @cell{@col};
+		    print "after\t@row\n" if $v >= 3;
+		}
+
+		if ($f)
+		{
+		    print CSV join("\t", map {s/\\/\\\\/gs; s/\t/\\t/gs; s/\n/\\n/gs; $_} @row), "\n";
+		}
+		else
+		{
+		    $sql .= "," if $m;
+		    $sql .= "(" . join(",", map {$dbh_src->quote($_)} @row) . ")";
+		}
+
+		$m++;
+	    }
+
+	    last unless $m;
+
+	    for my $dbh_dst (@dbh_dst)
+	    {
+		$dbh_dst->do($sql);
+	    }
+
+	    $count += $m;
+
+	    if (-t && $v && $v < 3)
+	    {
+		my $time = time;
+		if ($time > $timed)
+		{
+		    status($tag, $time, $start, $n, $count);
+		    $timed = $time;
+		}
+	    }
+
+	    last if $m < $batch;
+	}
+
+	if ($v && $v < 3)
+	{
+	    my $time = time;
+	    status($tag, $time, $start, $n, $count);
+	    print STDERR "\n" if -t;
+	}
+
+	my $target = "$dst_db.$dst_table";
+	my $trash = "mirror_trash.$dst_db\$$dst_table";
+
+	for my $dbh_dst (@dbh_dst)
+	{
+	    dbh_do($dbh_dst, "alter table $temptable enable keys");
+	    dbh_do($dbh_dst, "unlock tables");
+
+	    # create target database if it doesn't exist
+	    dbh_do($dbh_dst, "create database if not exists $dst_db");
+
+	    # create target table, so that "rename table $target to $trash" always works
+	    # (there is no rename table if exists, and anyway, we need "rename old to trash, new to old")
+	    dbh_do($dbh_dst, "create table if not exists $target (empty int)");
+
+	    if ($keep)
+	    {
+		dbh_do($dbh_dst, sprintf("drop table if exists $target\$%02d", $keep));
+
+		for (reverse 1 .. $keep - 1)
+		{
+		    dbh_do($dbh_dst, sprintf("create table if not exists $target\$%02d (empty int)", $_));
+		    dbh_do($dbh_dst, sprintf("rename table $target\$%02d to $target\$%02d", $_, $_ + 1));
+		}
+
+		$trash = "$target\$01";
+	    }
+	    else
+	    {
+		dbh_do($dbh_dst, "create database if not exists mirror_trash");
+		dbh_do($dbh_dst, "drop table if exists $trash");
+	    }
+	}
+
+	# now quickly swap in the new table on all target servers
+	# renaming both tables at once swaps in the new table atomically
+
+	for my $dbh_dst (@dbh_dst)
+	{
+	    dbh_do($dbh_dst, "rename table $target to $trash, $temptable to $target");
+	}
+    }
+
+    if ($child)
+    {
+	print "killing ssh pid=$child\n" if $v;
+	kill 1, $child;
+	wait;
+    }
+}
+
+
+if ($do && $dodo)
+{
+    if ($v)
+    {
+	print "*** $do\n";
+	system($do);
+    }
+    else
+    {
+	qx[$do];
+    }
+}
+
+
+sub status
+{
+    my($tag, $time, $start, $n, $count) = @_;
+    my $rate = $count / ($time - $start) if $time > $start;
+    my $persec = int(10 * $rate) / 10;
+    $persec .= ".0" unless $persec =~ /\./;
+    print STDERR "\r" if -t;
+    print STDERR "$tag\t$count of $n";
+    if ($n && $rate)
+    {
+	print STDERR " (@{[int(100 * $count / $n)]}%) $persec/s";
+	if ($count < $n)
+	{
+	    print STDERR " @{[hms(($n - $count) / $rate)]} remaining";
+	}
+	else
+	{
+	    print STDERR " completed in @{[hms($time - $start)]}";
+	}
+	print STDERR " " x 20;
+    }
+    print STDERR "\n" unless -t;
+}
+
+
+sub dbh_do
+{
+    my($dbh, @cmd) = @_;
+
+    print "dbh_do: @cmd\n" if $v >= 2;
+    $dbh->do(@cmd);
+}
+
+
+sub hms
+{
+    my($x);
+
+    for (@_)
+    {
+	my($s) = $_;
+
+	$x .= "	 " if $x;
+	$x .= "-" if $s < 0;
+
+	$s = abs($s);
+
+	my $y = int($s / (365.25 * 24 * 60 * 60)); $s -= 365.25 * 24 * 60 * 60 * $y;
+	my $d = int($s / (24 * 60 * 60)); $s -= 24 * 60 * 60 * $d;
+	my $h = int($s / (60 * 60)); $s -= 60 * 60 * $h;
+	my $m = int($s / 60); $s -= 60 * $m;
+	$s = int($s);
+
+	$x .= "${y}y " if $y;
+	$x .= "${d}d " if $d;# || $y;
+	$x .= "${h}h " if $h;# || $y || $d;
+	$x .= "${m}m " if $m;# || $y || $d || $h;
+	$x .= "${s}s"  if $s;# || $y || $d || $h || $m;
+    }
+
+    $x || '0s';
+}
