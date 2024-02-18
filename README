@@ -1,27 +1,47 @@
 # mirror
-mysql table copy/backup (written in Perl)
+mysql table copy/backup across multiple hosts (written in Perl)
+
+```text
+Usage:  $0 [-v] [-t] [-f] [-do="..."] [-where="..."] [DST_HOST.DST_DB.DST_TABLE=SRC_HOST.SRC_DB.SRC_TABLE ...]
+
+where
+        -v          verbose (-vv or -vvv for more verbose)
+        -t          Update target tables only if they are older than the source table.
+        -do=...     Run commands when finished copying.  If -t is specified, then
+                    commands are run only if a target table gets updated.
+        -where=...  Copy only the rows that meet the where constraint.
+        -f          The target is a file.  In the filename *'s will be replaced with
+                    the source host, database, and table names.
+        -create     Store the SQL create statement with the target file.
+        -stage      Create a temporary table with the results before sending anything.
+                    The source table is freed up quickly with this option.
+        -batch=NNNN Specify the number of records to insert per batch.  (Default: 1000)
+        -z          Use compression
+        -no-alias-detect
+                    Do not detect if target servers are aliases of the source server
+        -keep=N     Keep N old copies of the table in the target directory.
+
+Full-word switches can be specified with - or -- (e.g. -create or --create).
 
 Examples:
-```text
+        mirror db3.temp.test=db4.v2info.pmhit
+                copy table v2fino.pmhit from db4 to db3 and rename temp.test
 
-	mirror db3.temp.test=db4.v2info.pmhit
-		copy table v2fino.pmhit from db4 to db3 and rename temp.test
+        mirror db3.*.*=db2.v2info.*
+                copies all tables from db2.v2info to db3.v2info
 
-	mirror db3.*.*=db2.v2info.*
-		copies all tables from db2.v2info to db3.v2info
+        mirror db3.other.*=db2.v2info.*
+                copies all tables from db2.v2info to db3.other
 
-	mirror db3.other.*=db2.v2info.*
-		copies all tables from db2.v2info to db3.other
+        mirror -t -do="./mkslice -campaign_id=11,19" db.*.*=pd1.v2info.sourced
+                copies v2info.sourced from pd1 to db if the source is newer than the
+                target.  If the table is copied, then the mkslice command is run.
 
-	mirror -t -do="./mkslice -campaign_id=11,19" db.*.*=pd1.v2info.sourced
-		copies v2info.sourced from pd1 to db if the source is newer than the
-		target.	 If the table is copied, then the mkslice command is run.
+        mirror -f sourced.csv=dbany.v2info.sourced
+                creates a tab-separated file "sourced.csv" from the contents of
+                table v2info.sourced on dbany
 
-	mirror -f sourced.csv=dbany.v2info.sourced
-		creates a tab-separated file "sourced.csv" from the contents of
-		table v2info.sourced on dbany
-
-	mirror -t -do="./mkslice -campaign_id=11,19" -where=0 sourced.timestamp=dbany.v2info.sourced
-		checks to see if the file sourced.timestamp is older than the latest table updates.  If
-		so, the file modification time is updated, and the mkslice command is run.
+        mirror -t -do="./mkslice -campaign_id=11,19" -where=0 sourced.timestamp=dbany.v2info.sourced
+                checks to see if the file sourced.timestamp is older than the latest table updates.  If
+                so, the file modification time is updated, and the mkslice command is run.
 ```
