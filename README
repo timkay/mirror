@@ -1,0 +1,27 @@
+# mirror
+mysql table copy/backup (written in Perl)
+
+Examples:
+```text
+
+	mirror db3.temp.test=db4.v2info.pmhit
+		copy table v2fino.pmhit from db4 to db3 and rename temp.test
+
+	mirror db3.*.*=db2.v2info.*
+		copies all tables from db2.v2info to db3.v2info
+
+	mirror db3.other.*=db2.v2info.*
+		copies all tables from db2.v2info to db3.other
+
+	mirror -t -do="./mkslice -campaign_id=11,19" db.*.*=pd1.v2info.sourced
+		copies v2info.sourced from pd1 to db if the source is newer than the
+		target.	 If the table is copied, then the mkslice command is run.
+
+	mirror -f sourced.csv=dbany.v2info.sourced
+		creates a tab-separated file "sourced.csv" from the contents of
+		table v2info.sourced on dbany
+
+	mirror -t -do="./mkslice -campaign_id=11,19" -where=0 sourced.timestamp=dbany.v2info.sourced
+		checks to see if the file sourced.timestamp is older than the latest table updates.  If
+		so, the file modification time is updated, and the mkslice command is run.
+```
